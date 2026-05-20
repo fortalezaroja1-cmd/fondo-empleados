@@ -113,7 +113,7 @@ function TabPagos({ misPagos }) {
 function TabSimulador({ socio, config }) {
   const [monto, setMonto] = useState('')
   const [plazo, setPlazo] = useState(12)
-  const ahorro = socio.ahorroAcumulado || 0
+  const ahorro = parseFloat(socio?.ahorroAcumulado) || 0
   const m = parseFloat(monto) || 0
 
   let resultado = null

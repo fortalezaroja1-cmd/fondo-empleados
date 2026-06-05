@@ -1,4 +1,4 @@
-\import {useState,useEffect} from 'react'
+import {useState,useEffect} from 'react'
 import {loadAll} from './supabase.js'
 import {Spinner} from './components/UI.jsx'
 import Login from './pages/Login.jsx'

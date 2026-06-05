@@ -1,11 +1,10 @@
 import { createClient } from '@supabase/supabase-js'
 
-const url = import.meta.env.VITE_SUPABASE_URL
-const key = import.meta.env.VITE_SUPABASE_ANON_KEY
+const url = 'https://ynvxfgxnzpghwncgsnzf.supabase.co'
+const key = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InludnhmZ3huenBnaHduY2dzbnpmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkyNzk3MDIsImV4cCI6MjA5NDg1NTcwMn0.iBsutg-GWW6CO7ArNlFHEEpxyV2oYxq5Svv1kMBSvAw'
 
 export const sb = createClient(url, key)
 
-// ─── helpers de mapeo ────────────────────────────────
 export const mapSocio = r => ({
   id: r.id, nombre: r.nombre, cedula: r.cedula, telefono: r.telefono||'',
   ahorroQuincenal: parseFloat(r.ahorro_quincenal)||0,
@@ -55,7 +54,6 @@ export const mapConfig = r => ({
   utilidadPct: parseFloat(r.utilidad_pct)||1.3
 })
 
-// ─── carga completa ──────────────────────────────────
 export async function loadAll() {
   const [cfg, soc, pre, pag, caj, py, sol] = await Promise.all([
     sb.from('config').select('*').limit(1).single(),

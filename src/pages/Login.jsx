@@ -22,3 +22,5 @@ export default function Login({db,onAdmin,onSocio}){
     <div style={{width:'100%',maxWidth:400}}>
       <h1 style={{fontSize:26,fontWeight:700,marginBottom:4}}>{db.config.nombre||'Fondo de Empleados'}</h1>
       <p style={{fontSize:14,color:'#6b6b66',marginBottom:32}}>Ingresa tus datos para continuar</p>
+      <div style={{display:'flex',flexDirection:'column',gap:14}}>
+        <Field

@@ -1,21 +1,21 @@
 import { useState } from 'react'
 import { sb } from '../../supabase.js'
-import { uid, hoy, fmt, fmtPct } from '../../helpers.js'
+import { uid, hoy, fmt, fmtPct, calcInteresQuincena, calcSeparacion, calcATiempo, calcUtilidadAporte } from '../../helpers.js'
 import { Badge, Btn, Field, Modal, IS, Metric, EmptyState } from '../../components/UI.jsx'
 
-export default function AdminSocioDetalle({ socioId, db, refresh, onVolver }) {
+export default function AdminSocioDetalle({ socioId, db, refresh, onVolver, esSuperAdmin }) {
   const [tab, setTab] = useState('resumen')
   const [modalPago, setModalPago] = useState(false)
-  const [modalPrestamo, setModalPrestamo] = useState(false)
+  const [modalEditPago, setModalEditPago] = useState(null)
   const [modalAhorro, setModalAhorro] = useState(false)
   const [modalEditar, setModalEditar] = useState(false)
   const [formPago, setFormPago] = useState({})
-  const [formPrestamo, setFormPrestamo] = useState({})
+  const [formEditPago, setFormEditPago] = useState({})
   const [formAhorro, setFormAhorro] = useState({})
   const [formEditar, setFormEditar] = useState({})
+  const [tipoPago, setTipoPago] = useState(null)
   const [saving, setSaving] = useState(false)
   const [infoTasa, setInfoTasa] = useState('')
-  const [infoPago, setInfoPago] = useState('')
 
   const socio = db.socios.find(x => x.id === socioId)
   if (!socio) return <div style={{ padding: 20 }}>Socio no encontrado.</div>
@@ -25,23 +25,16 @@ export default function AdminSocioDetalle({ socioId, db, refresh, onVolver }) {
   const misPagos = db.pagos.filter(p => p.socioId === socioId).sort((a, b) => b.fecha.localeCompare(a.fecha))
   const misPrestaya = db.prestaya.filter(p => p.socioId === socioId)
   const solPendientes = db.solicitudesPrestaya.filter(s => s.socioId === socioId && s.estado === 'pendiente')
+  const misAportes = db.aportes.filter(a => a.socioId === socioId).sort((a, b) => (b.fechaPago || '').localeCompare(a.fechaPago || ''))
 
   const totalDeuda = prestamosActivos.reduce((a, p) => a + p.saldoCapital, 0)
   const totalIntereses = misPagos.reduce((a, p) => a + p.interesPagado, 0)
   const totalPagado = misPagos.filter(p => p.estado === 'pagado').reduce((a, p) => a + p.total, 0)
-
-  const calcInteresQuincena = (prestamo) => (prestamo.saldoCapital * (prestamo.tasa / 100)) / 2
-
-  const calcSeparacion = (prestamoId, montoPago) => {
-    const p = db.prestamos.find(x => x.id === prestamoId)
-    if (!p || !montoPago) return null
-    const interesQuincena = calcInteresQuincena(p)
-    const pago = parseFloat(montoPago) || 0
-    const interesAplicado = Math.min(interesQuincena, pago)
-    const capitalAplicado = Math.max(0, pago - interesAplicado)
-    const nuevoSaldo = Math.max(0, p.saldoCapital - capitalAplicado)
-    return { interesAplicado, capitalAplicado, nuevoSaldo, interesQuincena, p }
-  }
+  const totalUtilidades = misAportes.reduce((a, ap) => a + ap.utilidadGenerada, 0)
+  const utilPerdida = misAportes.filter(a => a.aTiempo === false).reduce((a, ap) => {
+    const p = db.periodos.find(x => x.id === ap.periodoId)
+    return a + ((ap.monto || 0) * (p?.utilidadPct || db.config.utilidadPct) / 100)
+  }, 0)
 
   const getTasa = (monto) => {
     const m = parseFloat(monto) || 0
@@ -51,6 +44,16 @@ export default function AdminSocioDetalle({ socioId, db, refresh, onVolver }) {
     return { tasa: 3.5, info: `⚠️ ${fmt(m)} supera ahorro en ${fmt(m - ah)} → tasa 3.5%` }
   }
 
+  // Calcular separación en tiempo real
+  const getSep = () => {
+    if (tipoPago !== 'prestamo' && tipoPago !== 'mixto') return null
+    const p = db.prestamos.find(x => x.id === formPago.prestamoId)
+    if (!p || !formPago.montoDeuda) return null
+    return calcSeparacion(p, formPago.montoDeuda)
+  }
+  const sep = getSep()
+
+  // Guardar edición del socio
   const guardarEdicion = async () => {
     if (!formEditar.nombre?.trim()) { alert('Nombre requerido'); return }
     setSaving(true)
@@ -65,72 +68,159 @@ export default function AdminSocioDetalle({ socioId, db, refresh, onVolver }) {
     await refresh(); setSaving(false); setModalEditar(false)
   }
 
+  // Registrar abono a ahorros
   const guardarAhorro = async () => {
     const monto = parseFloat(formAhorro.monto) || 0
     if (monto <= 0) { alert('Monto inválido'); return }
     setSaving(true)
+    const periodo = db.periodos.find(x => x.id === formAhorro.periodoId)
+    const aTiempo = periodo ? calcATiempo(periodo.fechaCorte, formAhorro.fecha || hoy()) : null
+    const utilPct = periodo ? periodo.utilidadPct : (db.config.utilidadPct || 1.3)
+    const utilGenerada = calcUtilidadAporte(monto, utilPct, aTiempo)
     const nuevoAcumulado = (socio.ahorroAcumulado || 0) + monto
+
     await sb.from('socios').update({ ahorro_acumulado: nuevoAcumulado }).eq('id', socioId)
     await sb.from('caja').insert({
       id: uid(), tipo: 'ingreso', fecha: formAhorro.fecha || hoy(),
       concepto: `Ahorro - ${socio.nombre}`, monto,
       referencia: socioId, responsable: '', notas: formAhorro.notas || ''
     })
+
+    // Registrar aporte con período
+    if (periodo) {
+      await sb.from('aportes').insert({
+        id: uid(), socio_id: socioId, periodo_id: formAhorro.periodoId,
+        fecha_pago: formAhorro.fecha || hoy(), monto,
+        a_tiempo: aTiempo, utilidad_pct: utilPct, utilidad_generada: utilGenerada,
+        notas: formAhorro.notas || ''
+      })
+      // Registrar utilidad en caja de utilidades
+      if (utilGenerada > 0) {
+        await sb.from('utilidades_caja').insert({
+          id: uid(), fecha: formAhorro.fecha || hoy(),
+          concepto: `Utilidad ahorro - ${socio.nombre} (${periodo.descripcion || periodo.fechaCorte})`,
+          monto: utilGenerada, socio_id: socioId, periodo_id: formAhorro.periodoId,
+          tipo: 'utilidad_ahorro'
+        })
+      }
+    }
+
     await refresh(); setSaving(false); setModalAhorro(false); setFormAhorro({})
   }
 
-  const guardarPrestamo = async () => {
-    const monto = parseFloat(formPrestamo.monto) || 0
-    if (monto <= 0) { alert('Monto inválido'); return }
-    const tasaManual = parseFloat(formPrestamo.tasaManual)
-    const { tasa: tasaAuto } = getTasa(monto)
-    const tasa = tasaManual > 0 ? tasaManual : tasaAuto
-    if (!tasa) { alert('Define la tasa'); return }
-    setSaving(true)
-    const pid = uid()
-    await sb.from('prestamos').insert({
-      id: pid, socio_id: socioId, monto, saldo_capital: monto,
-      tasa, plazo: parseInt(formPrestamo.plazo) || 0,
-      fecha_inicio: formPrestamo.fechaInicio || hoy(),
-      estado: 'activo', notas: formPrestamo.notas || ''
-    })
-    await sb.from('caja').insert({
-      id: uid(), tipo: 'desembolso', fecha: formPrestamo.fechaInicio || hoy(),
-      concepto: `Desembolso - ${socio.nombre}`, monto,
-      referencia: pid, responsable: '', notas: ''
-    })
-    await refresh(); setSaving(false); setModalPrestamo(false); setFormPrestamo({}); setInfoTasa('')
-  }
-
+  // Registrar pago con tipo y separación
   const guardarPago = async () => {
-    const { prestamoId, fecha, fechaCorte, monto, estado } = formPago
-    if (!prestamoId || !(parseFloat(monto) > 0)) { alert('Selecciona préstamo y monto'); return }
-    const sep = calcSeparacion(prestamoId, monto)
-    if (!sep) return
+    if (!tipoPago) { alert('Selecciona el tipo de pago'); return }
+    const montoTotal = parseFloat(formPago.montoTotal) || 0
+    if (montoTotal <= 0) { alert('Monto inválido'); return }
     setSaving(true)
+
+    let montoCapital = 0, montoInteres = 0, montoAhorro = 0
     const pgId = uid()
-    await sb.from('pagos').insert({
-      id: pgId, socio_id: socioId, prestamo_id: prestamoId,
-      fecha: fecha || hoy(), fecha_corte: fechaCorte || null,
-      capital_abonado: sep.capitalAplicado,
-      interes_pagado: sep.interesAplicado,
-      total: parseFloat(monto),
-      estado: estado || 'pagado', notas: formPago.notas || ''
-    })
-    await sb.from('prestamos').update({
-      saldo_capital: sep.nuevoSaldo,
-      estado: sep.nuevoSaldo === 0 ? 'cancelado' : 'activo'
-    }).eq('id', prestamoId)
-    if ((estado || 'pagado') === 'pagado') {
-      await sb.from('caja').insert({
-        id: uid(), tipo: 'ingreso', fecha: fecha || hoy(),
-        concepto: `Pago préstamo - ${socio.nombre}`, monto: parseFloat(monto),
-        referencia: pgId, responsable: '', notas: ''
-      })
+
+    if (tipoPago === 'ahorro') {
+      montoAhorro = montoTotal
+      await sb.from('socios').update({ ahorro_acumulado: (socio.ahorroAcumulado || 0) + montoTotal }).eq('id', socioId)
+    } else if (tipoPago === 'prestamo') {
+      const p = db.prestamos.find(x => x.id === formPago.prestamoId)
+      if (!p) { alert('Selecciona un préstamo'); setSaving(false); return }
+      const sepCalc = calcSeparacion(p, formPago.montoDeuda || montoTotal)
+      montoCapital = sepCalc.capitalAplicado
+      montoInteres = sepCalc.interesAplicado
+      await sb.from('prestamos').update({
+        saldo_capital: sepCalc.nuevoSaldo,
+        estado: sepCalc.nuevoSaldo === 0 ? 'cancelado' : 'activo'
+      }).eq('id', formPago.prestamoId)
+      // Registrar interés en caja de utilidades
+      if (montoInteres > 0) {
+        await sb.from('utilidades_caja').insert({
+          id: uid(), fecha: formPago.fecha || hoy(),
+          concepto: `Interés préstamo - ${socio.nombre}`,
+          monto: montoInteres, socio_id: socioId, prestamo_id: formPago.prestamoId,
+          tipo: 'interes_prestamo'
+        })
+      }
+    } else if (tipoPago === 'mixto') {
+      // Mixto: parte va a ahorro, parte a deuda
+      montoAhorro = parseFloat(formPago.montoAhorro) || 0
+      const montoDeudaTotal = parseFloat(formPago.montoDeuda) || 0
+      if (formPago.prestamoId && montoDeudaTotal > 0) {
+        const p = db.prestamos.find(x => x.id === formPago.prestamoId)
+        if (p) {
+          const sepCalc = calcSeparacion(p, montoDeudaTotal)
+          montoCapital = sepCalc.capitalAplicado
+          montoInteres = sepCalc.interesAplicado
+          await sb.from('prestamos').update({
+            saldo_capital: sepCalc.nuevoSaldo,
+            estado: sepCalc.nuevoSaldo === 0 ? 'cancelado' : 'activo'
+          }).eq('id', formPago.prestamoId)
+          if (montoInteres > 0) {
+            await sb.from('utilidades_caja').insert({
+              id: uid(), fecha: formPago.fecha || hoy(),
+              concepto: `Interés préstamo - ${socio.nombre}`,
+              monto: montoInteres, socio_id: socioId, prestamo_id: formPago.prestamoId,
+              tipo: 'interes_prestamo'
+            })
+          }
+        }
+      }
+      if (montoAhorro > 0) {
+        await sb.from('socios').update({ ahorro_acumulado: (socio.ahorroAcumulado || 0) + montoAhorro }).eq('id', socioId)
+      }
+    } else if (tipoPago === 'interes') {
+      montoInteres = montoTotal
+      if (formPago.prestamoId && montoInteres > 0) {
+        await sb.from('utilidades_caja').insert({
+          id: uid(), fecha: formPago.fecha || hoy(),
+          concepto: `Interés préstamo - ${socio.nombre}`,
+          monto: montoInteres, socio_id: socioId, prestamo_id: formPago.prestamoId,
+          tipo: 'interes_prestamo'
+        })
+      }
     }
-    await refresh(); setSaving(false); setModalPago(false); setFormPago({}); setInfoPago('')
+
+    await sb.from('pagos').insert({
+      id: pgId, socio_id: socioId, prestamo_id: formPago.prestamoId || null,
+      fecha: formPago.fecha || hoy(), fecha_corte: formPago.fechaCorte || null,
+      capital_abonado: montoCapital, interes_pagado: montoInteres,
+      total: montoTotal, estado: 'pagado', notas: formPago.notas || '',
+      tipo_pago: tipoPago, monto_capital: montoCapital,
+      monto_interes: montoInteres, monto_ahorro: montoAhorro
+    })
+
+    await sb.from('caja').insert({
+      id: uid(), tipo: 'ingreso', fecha: formPago.fecha || hoy(),
+      concepto: `Pago (${tipoPago}) - ${socio.nombre}`, monto: montoTotal,
+      referencia: pgId, responsable: '', notas: ''
+    })
+
+    await refresh(); setSaving(false); setModalPago(false)
+    setFormPago({}); setTipoPago(null)
   }
 
+  // Editar pago existente (Solo Super Admin)
+  const guardarEditPago = async () => {
+    if (!esSuperAdmin) return
+    setSaving(true)
+    const pg = modalEditPago
+    const montoCapital = parseFloat(formEditPago.montoCapital) || 0
+    const montoInteres = parseFloat(formEditPago.montoInteres) || 0
+    const montoAhorro = parseFloat(formEditPago.montoAhorro) || 0
+    const nuevoTotal = montoCapital + montoInteres + montoAhorro
+
+    await sb.from('pagos').update({
+      tipo_pago: formEditPago.tipoPago,
+      monto_capital: montoCapital, monto_interes: montoInteres,
+      monto_ahorro: montoAhorro, capital_abonado: montoCapital,
+      interes_pagado: montoInteres, total: nuevoTotal,
+      notas: formEditPago.notas || '',
+      editado_por: 'superadmin', editado_at: new Date().toISOString()
+    }).eq('id', pg.id)
+
+    await refresh(); setSaving(false); setModalEditPago(null)
+  }
+
+  // Aprobar/rechazar PrestaYA
   const aprobarPrestaya = async (id) => {
     const sol = db.solicitudesPrestaya.find(x => x.id === id)
     const pyId = uid()
@@ -164,8 +254,15 @@ export default function AdminSocioDetalle({ socioId, db, refresh, onVolver }) {
     await refresh()
   }
 
-  const TABS = [['resumen','Resumen'],['ahorros','Ahorros'],['prestamos','Préstamos'],['pagos','Pagos'],['prestaya','PrestaYA'],['historial','Historial']]
-  const tabS = active => ({ padding:'10px 14px', fontSize:13, background:'transparent', border:'none', borderBottom:active?'2px solid #1a1a18':'2px solid transparent', color:active?'#1a1a18':'#aaa', cursor:'pointer', fontWeight:active?600:400, whiteSpace:'nowrap' })
+  const TABS = [['resumen','Resumen'],['ahorros','Ahorros'],['prestamos','Préstamos'],['pagos','Pagos'],['utilidades','Utilidades'],['prestaya','PrestaYA'],['historial','Historial']]
+  const tabS = active => ({ padding:'10px 14px', fontSize:12, background:'transparent', border:'none', borderBottom:active?'2px solid #1a1a18':'2px solid transparent', color:active?'#1a1a18':'#aaa', cursor:'pointer', fontWeight:active?600:400, whiteSpace:'nowrap' })
+
+  const TIPOS_PAGO = [
+    { id: 'ahorro', icon: '💰', label: 'Ahorro', color: '#3B6D11', bg: '#EAF3DE' },
+    { id: 'prestamo', icon: '🏦', label: 'Abono deuda', color: '#185FA5', bg: '#E6F1FB' },
+    { id: 'mixto', icon: '🔀', label: 'Mixto', color: '#854F0B', bg: '#FAEEDA' },
+    { id: 'interes', icon: '💸', label: 'Solo interés', color: '#791F1F', bg: '#FCEBEB' },
+  ]
 
   return (
     <div>
@@ -186,15 +283,14 @@ export default function AdminSocioDetalle({ socioId, db, refresh, onVolver }) {
       <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:16 }}>
         <Metric label="Ahorro acumulado" value={fmt(socio.ahorroAcumulado)} color="var(--green)"/>
         <Metric label="Total deuda" value={fmt(totalDeuda)} color={totalDeuda>0?'var(--red)':undefined}/>
+        <Metric label="Utilidades generadas" value={fmt(totalUtilidades)} color="var(--green)"/>
         <Metric label="Intereses cobrados" value={fmt(totalIntereses)}/>
-        <Metric label="Total pagado" value={fmt(totalPagado)}/>
       </div>
 
       {/* Acciones rápidas */}
       <div style={{ display:'flex', gap:8, marginBottom:16, overflowX:'auto', paddingBottom:4 }}>
-        <Btn primary onClick={() => { setFormAhorro({fecha:hoy(),monto:'',notas:''}); setModalAhorro(true) }} style={{ whiteSpace:'nowrap', minHeight:40, fontSize:13 }}>+ Ahorro</Btn>
-        <Btn primary onClick={() => { setFormPrestamo({monto:'',tasaManual:'',plazo:'',fechaInicio:hoy(),notas:''}); setInfoTasa(''); setModalPrestamo(true) }} style={{ whiteSpace:'nowrap', minHeight:40, fontSize:13 }}>+ Préstamo</Btn>
-        <Btn primary onClick={() => { setFormPago({prestamoId:'',fecha:hoy(),fechaCorte:'',monto:'',estado:'pagado',notas:''}); setInfoPago(''); setModalPago(true) }} style={{ whiteSpace:'nowrap', minHeight:40, fontSize:13 }} disabled={prestamosActivos.length===0}>+ Pago</Btn>
+        <Btn primary onClick={() => { setModalAhorro(true); setFormAhorro({fecha:hoy(),monto:'',periodoId:'',notas:''}) }} style={{ whiteSpace:'nowrap', minHeight:40, fontSize:13 }}>+ Ahorro</Btn>
+        <Btn primary onClick={() => { setModalPago(true); setTipoPago(null); setFormPago({fecha:hoy(),fechaCorte:'',notas:''}) }} style={{ whiteSpace:'nowrap', minHeight:40, fontSize:13 }}>+ Pago</Btn>
       </div>
 
       {/* Tabs */}
@@ -239,7 +335,7 @@ export default function AdminSocioDetalle({ socioId, db, refresh, onVolver }) {
             <div style={{ fontSize:12, color:'#3B6D11', marginTop:4 }}>Quincenal: {fmt(socio.ahorroQuincenal)}</div>
           </div>
           <div style={{ display:'flex', justifyContent:'flex-end', marginBottom:12 }}>
-            <Btn primary onClick={() => { setFormAhorro({fecha:hoy(),monto:'',notas:''}); setModalAhorro(true) }} style={{ minHeight:40, fontSize:13 }}>+ Registrar abono</Btn>
+            <Btn primary onClick={() => { setModalAhorro(true); setFormAhorro({fecha:hoy(),monto:'',periodoId:'',notas:''}) }} style={{ minHeight:40, fontSize:13 }}>+ Registrar abono</Btn>
           </div>
           {db.caja.filter(m => m.referencia===socioId && m.tipo==='ingreso' && m.concepto?.includes('Ahorro')).length===0
             ? <EmptyState msg="Sin aportes registrados"/>
@@ -260,17 +356,14 @@ export default function AdminSocioDetalle({ socioId, db, refresh, onVolver }) {
       {/* PRÉSTAMOS */}
       {tab==='prestamos' && (
         <div>
-          <div style={{ display:'flex', justifyContent:'flex-end', marginBottom:12 }}>
-            <Btn primary onClick={() => { setFormPrestamo({monto:'',tasaManual:'',plazo:'',fechaInicio:hoy(),notas:''}); setInfoTasa(''); setModalPrestamo(true) }} style={{ minHeight:40, fontSize:13 }}>+ Nuevo préstamo</Btn>
-          </div>
           {misPrestamos.length===0 ? <EmptyState msg="Sin préstamos registrados"/> :
-          misPrestamos.map(p => {
+          misPrestamos.map((p,i) => {
             const pct = p.monto>0 ? Math.min((1-p.saldoCapital/p.monto)*100,100) : 100
             const interesQ = calcInteresQuincena(p)
             return (
               <div key={p.id} style={{ background:'#fff', borderRadius:14, padding:16, marginBottom:10, border:'1px solid rgba(0,0,0,0.08)' }}>
                 <div style={{ display:'flex', justifyContent:'space-between', marginBottom:8 }}>
-                  <strong style={{ fontSize:16 }}>{fmt(p.monto)}</strong>
+                  <strong style={{ fontSize:16 }}>Deuda {i+1} — {fmt(p.monto)}</strong>
                   <Badge c={p.estado==='activo'?'blue':'green'}>{p.estado}</Badge>
                 </div>
                 <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginBottom:10, fontSize:13 }}>
@@ -291,13 +384,12 @@ export default function AdminSocioDetalle({ socioId, db, refresh, onVolver }) {
                     <div style={{ fontWeight:600 }}>{p.fechaInicio||'—'}</div>
                   </div>
                 </div>
-                <div style={{ background:'#f1f0eb', borderRadius:4, height:6, overflow:'hidden', marginBottom:4 }}>
+                <div style={{ background:'#f1f0eb', borderRadius:4, height:6, overflow:'hidden', marginBottom:8 }}>
                   <div style={{ background:'var(--green)', height:6, width:`${pct.toFixed(0)}%` }}/>
                 </div>
-                <div style={{ fontSize:11, color:'#aaa', marginBottom:p.estado==='activo'?10:0 }}>{pct.toFixed(0)}% pagado</div>
                 {p.estado==='activo' && (
-                  <Btn primary full onClick={() => { setFormPago({prestamoId:p.id,fecha:hoy(),fechaCorte:'',monto:'',estado:'pagado',notas:''}); setInfoPago(`Saldo: ${fmt(p.saldoCapital)} · Interés quinc.: ${fmt(interesQ)}`); setModalPago(true) }} style={{ minHeight:40, fontSize:13 }}>
-                    Registrar pago
+                  <Btn primary full onClick={() => { setModalPago(true); setTipoPago('prestamo'); setFormPago({prestamoId:p.id,fecha:hoy(),fechaCorte:'',montoDeuda:'',notas:''}) }} style={{ minHeight:40, fontSize:13 }}>
+                    Registrar pago →
                   </Btn>
                 )}
               </div>
@@ -310,38 +402,88 @@ export default function AdminSocioDetalle({ socioId, db, refresh, onVolver }) {
       {tab==='pagos' && (
         <div>
           <div style={{ display:'flex', justifyContent:'flex-end', marginBottom:12 }}>
-            <Btn primary onClick={() => { setFormPago({prestamoId:'',fecha:hoy(),fechaCorte:'',monto:'',estado:'pagado',notas:''}); setInfoPago(''); setModalPago(true) }} disabled={prestamosActivos.length===0} style={{ minHeight:40, fontSize:13 }}>+ Registrar pago</Btn>
+            <Btn primary onClick={() => { setModalPago(true); setTipoPago(null); setFormPago({fecha:hoy(),notas:''}) }} style={{ minHeight:40, fontSize:13 }}>+ Registrar pago</Btn>
           </div>
           {misPagos.length===0 ? <EmptyState msg="Sin pagos registrados"/> :
           misPagos.map(pg => {
-            let puntBadge = null
-            if(pg.fechaCorte && pg.fecha && pg.estado==='pagado'){
-              const limite=new Date(pg.fechaCorte+'T12:00:00')
-              let hab=0,cur=new Date(limite)
-              while(hab<3){cur.setDate(cur.getDate()+1);if(cur.getDay()!==0&&cur.getDay()!==6)hab++}
-              puntBadge=pg.fecha<=cur.toISOString().slice(0,10)?<Badge c="green">Puntual</Badge>:<Badge c="red">Tardío</Badge>
-            }
+            const tipoBadge = pg.tipoPago === 'ahorro' ? {c:'green',label:'💰 Ahorro'} : pg.tipoPago === 'mixto' ? {c:'amber',label:'🔀 Mixto'} : pg.tipoPago === 'interes' ? {c:'red',label:'💸 Interés'} : {c:'blue',label:'🏦 Deuda'}
             return (
               <div key={pg.id} style={{ background:'#fff', borderRadius:14, padding:16, marginBottom:10, border:'1px solid rgba(0,0,0,0.08)' }}>
                 <div style={{ display:'flex', justifyContent:'space-between', marginBottom:6 }}>
-                  <span style={{ fontSize:13, color:'#6b6b66' }}>{pg.fecha}</span>
-                  <Badge c={pg.estado==='pagado'?'green':pg.estado==='atrasado'?'red':'amber'}>{pg.estado}</Badge>
+                  <div>
+                    <span style={{ fontSize:13, color:'#6b6b66' }}>{pg.fecha}</span>
+                    {pg.editadoPor && <span style={{ fontSize:10, color:'#854F0B', marginLeft:8 }}>✏ Editado</span>}
+                  </div>
+                  <Badge c={tipoBadge.c}>{tipoBadge.label}</Badge>
                 </div>
                 <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:8, fontSize:13, marginBottom:8 }}>
+                  {pg.montoAhorro > 0 && (
+                    <div style={{ background:'#EAF3DE', borderRadius:8, padding:'6px 10px' }}>
+                      <div style={{ fontSize:10, color:'#3B6D11' }}>AHORRO</div>
+                      <div style={{ fontWeight:600, color:'var(--green)' }}>{fmt(pg.montoAhorro)}</div>
+                    </div>
+                  )}
+                  {pg.montoCapital > 0 && (
+                    <div style={{ background:'#E6F1FB', borderRadius:8, padding:'6px 10px' }}>
+                      <div style={{ fontSize:10, color:'#185FA5' }}>CAPITAL</div>
+                      <div style={{ fontWeight:600, color:'var(--blue)' }}>{fmt(pg.montoCapital)}</div>
+                    </div>
+                  )}
+                  {pg.montoInteres > 0 && (
+                    <div style={{ background:'#FAEEDA', borderRadius:8, padding:'6px 10px' }}>
+                      <div style={{ fontSize:10, color:'#633806' }}>INTERÉS</div>
+                      <div style={{ fontWeight:600, color:'var(--amber)' }}>{fmt(pg.montoInteres)}</div>
+                    </div>
+                  )}
                   <div style={{ background:'#f5f4f0', borderRadius:8, padding:'6px 10px' }}>
-                    <div style={{ fontSize:10, color:'#6b6b66' }}>CAPITAL</div>
-                    <div style={{ fontWeight:600 }}>{fmt(pg.capitalAbonado)}</div>
-                  </div>
-                  <div style={{ background:'#FAEEDA', borderRadius:8, padding:'6px 10px' }}>
-                    <div style={{ fontSize:10, color:'#633806' }}>INTERÉS</div>
-                    <div style={{ fontWeight:600, color:'var(--amber)' }}>{fmt(pg.interesPagado)}</div>
-                  </div>
-                  <div style={{ background:'#EAF3DE', borderRadius:8, padding:'6px 10px' }}>
-                    <div style={{ fontSize:10, color:'#3B6D11' }}>TOTAL</div>
-                    <div style={{ fontWeight:700, color:'#3B6D11' }}>{fmt(pg.total)}</div>
+                    <div style={{ fontSize:10, color:'#6b6b66' }}>TOTAL</div>
+                    <div style={{ fontWeight:700 }}>{fmt(pg.total)}</div>
                   </div>
                 </div>
-                {puntBadge && <div>{puntBadge}</div>}
+                {esSuperAdmin && (
+                  <div style={{ display:'flex', justifyContent:'flex-end' }}>
+                    <button onClick={() => { setModalEditPago(pg); setFormEditPago({tipoPago:pg.tipoPago||'prestamo', montoCapital:pg.montoCapital||0, montoInteres:pg.montoInteres||0, montoAhorro:pg.montoAhorro||0, notas:pg.notas||''}) }}
+                      style={{ fontSize:12, color:'var(--amber)', background:'none', border:'none', cursor:'pointer', fontWeight:600 }}>
+                      ✏ Editar · 🔐 Super Admin
+                    </button>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {/* UTILIDADES */}
+      {tab==='utilidades' && (
+        <div>
+          <div style={{ background:'#1a1a18', borderRadius:14, padding:16, marginBottom:16, color:'#fff' }}>
+            <div style={{ fontSize:11, color:'#aaa', marginBottom:4 }}>UTILIDAD TOTAL GENERADA</div>
+            <div style={{ fontSize:28, fontWeight:700, color:'#7dd67a', marginBottom:6 }}>{fmt(totalUtilidades)}</div>
+            {utilPerdida > 0 && <div style={{ fontSize:12, color:'#f87171' }}>Perdiste {fmt(utilPerdida)} por pago tardío</div>}
+          </div>
+          {misAportes.length===0 ? <EmptyState msg="Sin aportes registrados en períodos"/> :
+          misAportes.map(ap => {
+            const periodo = db.periodos.find(x => x.id === ap.periodoId)
+            return (
+              <div key={ap.id} style={{ background:'#fff', borderRadius:12, padding:'12px 16px', marginBottom:8, border:`1.5px solid ${ap.aTiempo===false?'#A32D2D':ap.aTiempo===true?'#3B6D11':'rgba(0,0,0,0.08)'}` }}>
+                <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
+                  <div>
+                    <div style={{ fontWeight:600, fontSize:14 }}>{periodo?.descripcion || ap.periodoId || 'Sin período'}</div>
+                    <div style={{ fontSize:12, color:'#6b6b66', marginTop:2 }}>
+                      Pagaste: {ap.fechaPago || '—'}
+                      {periodo && ` · Límite: ${periodo.fechaLimite}`}
+                    </div>
+                    {ap.aTiempo===false && <div style={{ fontSize:11, color:'var(--red)', marginTop:4, fontWeight:600 }}>⚠ Pago tardío — sin utilidad este período</div>}
+                    {ap.aTiempo===null && <div style={{ fontSize:11, color:'var(--amber)', marginTop:4, fontWeight:600 }}>⏳ Pendiente de verificar</div>}
+                  </div>
+                  <div style={{ textAlign:'right' }}>
+                    <div style={{ fontSize:18, fontWeight:700, color:ap.utilidadGenerada>0?'var(--green)':'var(--red)' }}>
+                      {ap.utilidadGenerada>0?'+':''}{fmt(ap.utilidadGenerada)}
+                    </div>
+                    <div style={{ fontSize:10, color:'#6b6b66' }}>{fmtPct(ap.utilidadPct)} · Aporte: {fmt(ap.monto)}</div>
+                  </div>
+                </div>
               </div>
             )
           })}
@@ -355,8 +497,7 @@ export default function AdminSocioDetalle({ socioId, db, refresh, onVolver }) {
             <div style={{ fontSize:14, fontWeight:600, color:'var(--amber)', marginBottom:10 }}>⏳ Solicitudes pendientes</div>
             {solPendientes.map(sol => (
               <div key={sol.id} style={{ background:'#fff', borderRadius:14, padding:16, marginBottom:10, border:'2px solid var(--amber)' }}>
-                <div style={{ fontSize:13, marginBottom:8 }}>Monto: <strong>{fmt(sol.monto)}</strong> · Interés: {fmt(sol.interes)} · Total: <strong style={{ color:'var(--red)' }}>{fmt(sol.total)}</strong></div>
-                <div style={{ fontSize:12, color:'#6b6b66', marginBottom:10 }}>Vence: {sol.fechaVencimiento||'—'}</div>
+                <div style={{ fontSize:13, marginBottom:8 }}>Monto: <strong>{fmt(sol.monto)}</strong> · Total: <strong style={{ color:'var(--red)' }}>{fmt(sol.total)}</strong></div>
                 <div style={{ display:'flex', gap:8 }}>
                   <Btn primary full onClick={() => aprobarPrestaya(sol.id)} style={{ minHeight:40, fontSize:13 }}>✓ Aprobar</Btn>
                   <Btn danger full onClick={() => rechazarPrestaya(sol.id)} style={{ minHeight:40, fontSize:13 }}>✕ Rechazar</Btn>
@@ -373,7 +514,7 @@ export default function AdminSocioDetalle({ socioId, db, refresh, onVolver }) {
                   <strong>{fmt(py.monto)}</strong>
                   <Badge c={py.estado==='pagado'?'green':vencido?'red':'blue'}>{py.estado==='pagado'?'Pagado':vencido?'Vencido':'Activo'}</Badge>
                 </div>
-                <div style={{ fontSize:13, color:'#6b6b66', marginBottom:py.estado==='activo'?10:0 }}>Interés: {fmt(py.interes)} · Total: <strong>{fmt(py.total)}</strong> · Vence: {py.fechaVencimiento||'—'}</div>
+                <div style={{ fontSize:13, color:'#6b6b66', marginBottom:py.estado==='activo'?10:0 }}>Interés: {fmt(py.interes)} · Total: <strong>{fmt(py.total)}</strong></div>
                 {py.estado==='activo' && <Btn primary full onClick={() => pagarPrestaya(py.id)} style={{ minHeight:40, fontSize:13 }}>Marcar pagado</Btn>}
               </div>
             )
@@ -384,7 +525,7 @@ export default function AdminSocioDetalle({ socioId, db, refresh, onVolver }) {
       {/* HISTORIAL */}
       {tab==='historial' && (() => {
         const movimientos = [
-          ...misPagos.map(p => ({ key:p.id, fecha:p.fecha, titulo:`Pago préstamo`, detalle:`Capital: ${fmt(p.capitalAbonado)} · Interés: ${fmt(p.interesPagado)}`, monto:p.total, positivo:true })),
+          ...misPagos.map(p => ({ key:p.id, fecha:p.fecha, titulo:`Pago (${p.tipoPago||'prestamo'})`, detalle:`Capital: ${fmt(p.montoCapital)} · Interés: ${fmt(p.montoInteres)} · Ahorro: ${fmt(p.montoAhorro)}`, monto:p.total, positivo:true })),
           ...db.caja.filter(m => m.referencia===socioId || misPrestamos.some(p => p.id===m.referencia))
             .map(m => ({ key:m.id, fecha:m.fecha, titulo:m.concepto, detalle:m.tipo, monto:m.monto, positivo:m.tipo!=='desembolso' }))
         ].sort((a,b) => b.fecha.localeCompare(a.fecha))
@@ -402,7 +543,7 @@ export default function AdminSocioDetalle({ socioId, db, refresh, onVolver }) {
           ))
       })()}
 
-      {/* Modal Editar */}
+      {/* Modal Editar socio */}
       {modalEditar && (
         <Modal title="Editar socio" onClose={() => setModalEditar(false)}
           footer={<><Btn full onClick={() => setModalEditar(false)}>Cancelar</Btn><Btn primary full onClick={guardarEdicion} disabled={saving}>{saving?'Guardando...':'Guardar'}</Btn></>}>
@@ -426,64 +567,128 @@ export default function AdminSocioDetalle({ socioId, db, refresh, onVolver }) {
           <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
             <div style={{ background:'#EAF3DE', borderRadius:10, padding:12, fontSize:13, color:'#27500A' }}>Ahorro actual: <strong>{fmt(socio.ahorroAcumulado)}</strong></div>
             <Field label="Monto ($) *"><input style={IS} type="number" value={formAhorro.monto||''} onChange={e => setFormAhorro(f=>({...f,monto:e.target.value}))} placeholder="0"/></Field>
-            <Field label="Fecha"><input style={IS} type="date" value={formAhorro.fecha||''} onChange={e => setFormAhorro(f=>({...f,fecha:e.target.value}))}/></Field>
-            <Field label="Notas"><input style={IS} value={formAhorro.notas||''} onChange={e => setFormAhorro(f=>({...f,notas:e.target.value}))}/></Field>
-            {parseFloat(formAhorro.monto)>0 && <div style={{ background:'#f5f4f0', borderRadius:10, padding:12, fontSize:13 }}>Nuevo total: <strong style={{ color:'var(--green)' }}>{fmt((socio.ahorroAcumulado||0)+(parseFloat(formAhorro.monto)||0))}</strong></div>}
-          </div>
-        </Modal>
-      )}
-
-      {/* Modal Préstamo */}
-      {modalPrestamo && (
-        <Modal title="Nuevo préstamo" onClose={() => setModalPrestamo(false)}
-          footer={<><Btn full onClick={() => setModalPrestamo(false)}>Cancelar</Btn><Btn primary full onClick={guardarPrestamo} disabled={saving}>{saving?'Guardando...':'Crear'}</Btn></>}>
-          <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
-            <Field label="Monto ($) *"><input style={IS} type="number" value={formPrestamo.monto||''} onChange={e => { const {info}=getTasa(e.target.value); setFormPrestamo(f=>({...f,monto:e.target.value})); setInfoTasa(info) }}/></Field>
-            {infoTasa && <div style={{ background:'#f5f4f0', borderRadius:10, padding:12, fontSize:13, color:'#6b6b66' }}>{infoTasa}</div>}
-            <Field label="Tasa % por quincena (vacío = automática)"><input style={IS} type="number" step="0.01" placeholder={formPrestamo.monto?`Auto: ${getTasa(formPrestamo.monto).tasa||'—'}%`:'Ej: 2.5'} value={formPrestamo.tasaManual||''} onChange={e => setFormPrestamo(f=>({...f,tasaManual:e.target.value}))}/></Field>
-            <Field label="Plazo (quincenas)"><input style={IS} type="number" min="1" value={formPrestamo.plazo||''} onChange={e => setFormPrestamo(f=>({...f,plazo:e.target.value}))}/></Field>
-            <Field label="Fecha inicio"><input style={IS} type="date" value={formPrestamo.fechaInicio||''} onChange={e => setFormPrestamo(f=>({...f,fechaInicio:e.target.value}))}/></Field>
-            <Field label="Notas"><textarea style={{...IS,minHeight:60,resize:'vertical'}} value={formPrestamo.notas||''} onChange={e => setFormPrestamo(f=>({...f,notas:e.target.value}))}/></Field>
-          </div>
-        </Modal>
-      )}
-
-      {/* Modal Pago */}
-      {modalPago && (
-        <Modal title="Registrar pago" onClose={() => setModalPago(false)}
-          footer={<><Btn full onClick={() => setModalPago(false)}>Cancelar</Btn><Btn primary full onClick={guardarPago} disabled={saving}>{saving?'Guardando...':'Registrar'}</Btn></>}>
-          <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
-            <Field label="Préstamo *">
-              <select style={IS} value={formPago.prestamoId||''} onChange={e => {
-                const p=db.prestamos.find(x=>x.id===e.target.value)
-                const iq=p?calcInteresQuincena(p):0
-                setFormPago(f=>({...f,prestamoId:e.target.value}))
-                setInfoPago(p?`Saldo: ${fmt(p.saldoCapital)} · Interés quinc.: ${fmt(iq)}`:'')
-              }}>
-                <option value="">Seleccionar...</option>
-                {prestamosActivos.map(p=><option key={p.id} value={p.id}>{fmt(p.monto)} — Saldo: {fmt(p.saldoCapital)} — {p.tasa}%</option>)}
+            <Field label="Asociar a período (opcional)">
+              <select style={IS} value={formAhorro.periodoId||''} onChange={e => setFormAhorro(f=>({...f,periodoId:e.target.value}))}>
+                <option value="">Sin período específico</option>
+                {db.periodos.filter(p=>p.estado==='abierto').map(p=><option key={p.id} value={p.id}>{p.descripcion||p.fechaCorte} · Límite: {p.fechaLimite}</option>)}
               </select>
             </Field>
-            {infoPago && <div style={{ background:'#f5f4f0', borderRadius:10, padding:12, fontSize:13, color:'#6b6b66' }}>{infoPago}</div>}
-            <Field label="Monto del pago ($) *"><input style={IS} type="number" value={formPago.monto||''} onChange={e => setFormPago(f=>({...f,monto:e.target.value}))} placeholder="0"/></Field>
-            {formPago.prestamoId && parseFloat(formPago.monto)>0 && (() => {
-              const sep=calcSeparacion(formPago.prestamoId,formPago.monto)
-              if(!sep) return null
+            <Field label="Fecha del pago"><input style={IS} type="date" value={formAhorro.fecha||''} onChange={e => setFormAhorro(f=>({...f,fecha:e.target.value}))}/></Field>
+            {formAhorro.periodoId && formAhorro.fecha && (() => {
+              const p = db.periodos.find(x=>x.id===formAhorro.periodoId)
+              if(!p) return null
+              const aTiempo = calcATiempo(p.fechaCorte, formAhorro.fecha)
+              const util = calcUtilidadAporte(formAhorro.monto||0, p.utilidadPct, aTiempo)
               return (
-                <div style={{ background:'#EAF3DE', borderRadius:10, padding:14, fontSize:13 }}>
-                  <div style={{ fontWeight:600, color:'#27500A', marginBottom:8 }}>Separación automática:</div>
-                  <div style={{ display:'flex', justifyContent:'space-between', marginBottom:4 }}><span>→ Interés</span><strong style={{ color:'var(--amber)' }}>{fmt(sep.interesAplicado)}</strong></div>
-                  <div style={{ display:'flex', justifyContent:'space-between', marginBottom:4 }}><span>→ Capital</span><strong style={{ color:'var(--green)' }}>{fmt(sep.capitalAplicado)}</strong></div>
-                  <div style={{ borderTop:'1px solid rgba(0,0,0,0.1)', paddingTop:8, marginTop:8, display:'flex', justifyContent:'space-between' }}>
-                    <span>Nuevo saldo</span><strong style={{ color:'var(--red)' }}>{fmt(sep.nuevoSaldo)}</strong>
-                  </div>
+                <div style={{ background: aTiempo?'#EAF3DE':'#FCEBEB', borderRadius:10, padding:12, fontSize:13, color:aTiempo?'#27500A':'#791F1F' }}>
+                  {aTiempo ? `✅ Pago a tiempo — Utilidad generada: ${fmt(util)}` : `❌ Pago tardío (después del día 5) — Sin utilidad este período`}
                 </div>
               )
             })()}
-            <Field label="Fecha de corte"><input style={IS} type="date" value={formPago.fechaCorte||''} onChange={e => setFormPago(f=>({...f,fechaCorte:e.target.value}))}/></Field>
-            <Field label="Fecha de pago"><input style={IS} type="date" value={formPago.fecha||''} onChange={e => setFormPago(f=>({...f,fecha:e.target.value}))}/></Field>
-            <Field label="Estado"><select style={IS} value={formPago.estado||'pagado'} onChange={e => setFormPago(f=>({...f,estado:e.target.value}))}><option value="pagado">Pagado</option><option value="pendiente">Pendiente</option><option value="atrasado">Atrasado</option></select></Field>
-            <Field label="Notas"><input style={IS} value={formPago.notas||''} onChange={e => setFormPago(f=>({...f,notas:e.target.value}))}/></Field>
+            <Field label="Notas"><input style={IS} value={formAhorro.notas||''} onChange={e => setFormAhorro(f=>({...f,notas:e.target.value}))}/></Field>
+          </div>
+        </Modal>
+      )}
+
+      {/* Modal Pago con tipo */}
+      {modalPago && (
+        <Modal title="Registrar pago" onClose={() => { setModalPago(false); setTipoPago(null) }}
+          footer={<><Btn full onClick={() => { setModalPago(false); setTipoPago(null) }}>Cancelar</Btn><Btn primary full onClick={guardarPago} disabled={saving||!tipoPago}>{saving?'Guardando...':'Registrar'}</Btn></>}>
+          <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
+            {/* Selector tipo de pago - modo botón */}
+            <div>
+              <div style={{ fontSize:12, color:'#6b6b66', fontWeight:600, textTransform:'uppercase', letterSpacing:'0.04em', marginBottom:10 }}>¿A qué va este pago?</div>
+              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8 }}>
+                {TIPOS_PAGO.map(t => (
+                  <button key={t.id} onClick={() => setTipoPago(t.id)} style={{
+                    padding:'14px 8px', borderRadius:12, border:`2px solid`,
+                    borderColor: tipoPago===t.id ? t.color : 'rgba(0,0,0,0.1)',
+                    background: tipoPago===t.id ? t.bg : '#fff',
+                    cursor:'pointer', textAlign:'center', transition:'all .15s'
+                  }}>
+                    <div style={{ fontSize:22, marginBottom:4 }}>{t.icon}</div>
+                    <div style={{ fontSize:12, fontWeight:600, color:tipoPago===t.id?t.color:'#6b6b66' }}>{t.label}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {tipoPago && <>
+              <Field label="Monto total ($) *">
+                <input style={IS} type="number" value={formPago.montoTotal||''} onChange={e => setFormPago(f=>({...f,montoTotal:e.target.value}))} placeholder="0"/>
+              </Field>
+
+              {(tipoPago==='prestamo'||tipoPago==='mixto'||tipoPago==='interes') && (
+                <Field label="¿A cuál deuda?">
+                  <select style={IS} value={formPago.prestamoId||''} onChange={e => setFormPago(f=>({...f,prestamoId:e.target.value}))}>
+                    <option value="">Seleccionar deuda...</option>
+                    {prestamosActivos.map((p,i)=><option key={p.id} value={p.id}>Deuda {i+1} — Saldo: {fmt(p.saldoCapital)} — {p.tasa}%</option>)}
+                  </select>
+                </Field>
+              )}
+
+              {tipoPago==='mixto' && <>
+                <Field label="Monto que va a ahorro ($)">
+                  <input style={IS} type="number" value={formPago.montoAhorro||''} onChange={e => setFormPago(f=>({...f,montoAhorro:e.target.value}))} placeholder="0"/>
+                </Field>
+                <Field label="Monto que va a deuda ($)">
+                  <input style={IS} type="number" value={formPago.montoDeuda||''} onChange={e => setFormPago(f=>({...f,montoDeuda:e.target.value}))} placeholder="0"/>
+                </Field>
+              </>}
+
+              {tipoPago==='prestamo' && (
+                <Field label="Monto del abono a deuda ($)">
+                  <input style={IS} type="number" value={formPago.montoDeuda||''} onChange={e => setFormPago(f=>({...f,montoDeuda:e.target.value}))} placeholder="0"/>
+                </Field>
+              )}
+
+              {/* Separación automática en tiempo real */}
+              {sep && (
+                <div style={{ background:'#EAF3DE', borderRadius:12, padding:14, fontSize:13 }}>
+                  <div style={{ fontWeight:700, color:'#27500A', marginBottom:8 }}>Separación automática:</div>
+                  <div style={{ display:'flex', justifyContent:'space-between', marginBottom:4 }}><span>→ Interés quincena</span><strong style={{ color:'var(--amber)' }}>{fmt(sep.interesAplicado)}</strong></div>
+                  <div style={{ display:'flex', justifyContent:'space-between', marginBottom:4 }}><span>→ Capital</span><strong style={{ color:'var(--green)' }}>{fmt(sep.capitalAplicado)}</strong></div>
+                  <div style={{ borderTop:'1px solid rgba(0,0,0,0.1)', paddingTop:8, marginTop:8, display:'flex', justifyContent:'space-between' }}>
+                    <span>Nuevo saldo capital</span><strong style={{ color:'var(--red)' }}>{fmt(sep.nuevoSaldo)}</strong>
+                  </div>
+                  <div style={{ fontSize:11, color:'#3B6D11', marginTop:6 }}>💡 El interés queda registrado como utilidad del fondo</div>
+                </div>
+              )}
+
+              <Field label="Fecha del pago"><input style={IS} type="date" value={formPago.fecha||''} onChange={e => setFormPago(f=>({...f,fecha:e.target.value}))}/></Field>
+              <Field label="Notas"><input style={IS} value={formPago.notas||''} onChange={e => setFormPago(f=>({...f,notas:e.target.value}))}/></Field>
+            </>}
+          </div>
+        </Modal>
+      )}
+
+      {/* Modal Editar pago - Solo Super Admin */}
+      {modalEditPago && (
+        <Modal title="Editar pago · 🔐 Super Admin" onClose={() => setModalEditPago(null)}
+          footer={<><Btn full onClick={() => setModalEditPago(null)}>Cancelar</Btn><Btn primary full onClick={guardarEditPago} disabled={saving}>{saving?'Guardando...':'Guardar cambios'}</Btn></>}>
+          <div style={{ background:'#FAEEDA', borderRadius:10, padding:12, marginBottom:16, fontSize:12, color:'#633806', fontWeight:600 }}>
+            ⚠ Cambiar un pago histórico queda registrado con tu usuario y la fecha de edición.
+          </div>
+          <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
+            <Field label="Tipo de pago">
+              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8 }}>
+                {TIPOS_PAGO.map(t => (
+                  <button key={t.id} onClick={() => setFormEditPago(f=>({...f,tipoPago:t.id}))} style={{
+                    padding:'10px 8px', borderRadius:10, border:'2px solid',
+                    borderColor: formEditPago.tipoPago===t.id ? t.color : 'rgba(0,0,0,0.1)',
+                    background: formEditPago.tipoPago===t.id ? t.bg : '#fff',
+                    cursor:'pointer', textAlign:'center'
+                  }}>
+                    <div style={{ fontSize:18 }}>{t.icon}</div>
+                    <div style={{ fontSize:11, fontWeight:600, color:formEditPago.tipoPago===t.id?t.color:'#6b6b66' }}>{t.label}</div>
+                  </button>
+                ))}
+              </div>
+            </Field>
+            <Field label="Monto ahorro ($)"><input style={IS} type="number" value={formEditPago.montoAhorro||0} onChange={e => setFormEditPago(f=>({...f,montoAhorro:e.target.value}))}/></Field>
+            <Field label="Monto capital ($)"><input style={IS} type="number" value={formEditPago.montoCapital||0} onChange={e => setFormEditPago(f=>({...f,montoCapital:e.target.value}))}/></Field>
+            <Field label="Monto interés ($)"><input style={IS} type="number" value={formEditPago.montoInteres||0} onChange={e => setFormEditPago(f=>({...f,montoInteres:e.target.value}))}/></Field>
+            <Field label="Razón del ajuste (obligatorio)"><input style={IS} value={formEditPago.notas||''} onChange={e => setFormEditPago(f=>({...f,notas:e.target.value}))} placeholder="Ej: Corrección de registro incorrecto"/></Field>
           </div>
         </Modal>
       )}
